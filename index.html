@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>简易我的世界 - Three.js</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: 'Arial', sans-serif; }
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0,0,0,0.7);
+            color: #fff;
+            padding: 12px 24px;
+            border-radius: 8px;
+            pointer-events: none;
+            z-index: 100;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            border-left: 4px solid #4CAF50;
+        }
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 20px;
+            height: 20px;
+            transform: translate(-50%, -50%);
+            border: 2px solid rgba(255, 255, 255, 0.8);
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 50;
+            box-shadow: 0 0 10px rgba(0,0,0,0.5);
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0,0,0,0.6);
+            color: #fff;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 14px;
+            pointer-events: none;
+            z-index: 100;
+        }
+        #controls span {
+            background: #333;
+            padding: 2px 8px;
+            border-radius: 4px;
+            margin: 0 4px;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h2>⚡ 简易我的世界</h2>
+        <p>左键破坏方块 | 右键放置方块 | WASD行走 | 空格跳跃 | 鼠标控制视角</p>
+    </div>
+    <div id="crosshair"></div>
+    <div id="controls">
+        <span>W/A/S/D</span> 移动 · <span>空格</span> 跳跃 · <span>鼠标</span> 环顾 · <span>左键</span> 破坏 · <span>右键</span> 放置
+    </div>
+
+    <!-- 引入 Three.js 核心库和指针锁定控制器 -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.128.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.128.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+        // --- 初始化场景、相机、渲染器 ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x87CEEB); // 天空蓝
+        // 添加一点雾效，让远处更柔和
+        scene.fog = new THREE.Fog(0x87CEEB, 20, 100);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 2, 5); // 初始位置稍高一点
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true; // 开启阴影以增加立体感，但为了性能简单，我们不给每个方块都投射阴影，只保留环境光
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // --- 灯光 ---
+        // 环境光提供基础照明
+        const ambientLight = new THREE.AmbientLight(0x404060, 0.8);
+        scene.add(ambientLight);
+
+        // 方向光模拟太阳
+        const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+        dirLight.position.set(10, 20, 5);
+        dirLight.castShadow = true;
+        dirLight.receiveShadow = true;
+        dirLight.shadow.mapSize.width = 1024;
+        dirLight.shadow.mapSize.height = 1024;
+        const d = 30;
+        dirLight.shadow.camera.left = -d;
+        dirLight.shadow.camera.right = d;
+        dirLight.shadow.camera.top = d;
+        dirLight.shadow.camera.bottom = -d;
+        dirLight.shadow.camera.near = 1;
+        dirLight.shadow.camera.far = 50;
+        scene.add(dirLight);
+
+        // 补光，让背光面不至于太暗
+        const fillLight = new THREE.PointLight(0xccddff, 0.5);
+        fillLight.position.set(-5, 10, 10);
+        scene.add(fillLight);
+
+        // --- 地面网格辅助和基础地面 (一个大型草地平面，视觉上更像Minecraft的草地块) ---
+        // 为了简单且性能好，我们使用一个平面作为地面，但实际游玩时可以在上面放置方块。
+        // 但为了更像Minecraft，我们创建一个由方块构成的平坦地面？但那样开销大。这里用带纹理的平面模拟草地。
+        // 不过题目要求可以破坏和放置，如果地面是平面则无法破坏地面本身。所以我们用一个个方块构成地面？但为了性能，地面范围有限。
+        // 决定：创建一个 20x20 的方块地面区域，每个方块大小1x1x1。这样玩家可以破坏地面方块，也可以放置新的方块。
+        // 但为了增加趣味且不过度消耗性能，我们创建 20x20 的草地砖块，每个方块是一个独立的立方体。
+        // 但为了性能更好，我们只创建可视范围内的方块，并且使用BufferGeometry合并？或者使用InstancedMesh？但破坏和添加需要动态管理。
+        // 为了简便且支持破坏/放置，我们使用独立的Mesh对象，数量控制在合理范围（比如15x15=225个）。加上周围环境。
+        
+        // 存储所有方块的数组（用于射线检测和操作）
+        let blocks = []; // 每个元素是 { mesh, type }，但我们直接使用 mesh.userData 来存储类型等
+        
+        // 方块尺寸
+        const BLOCK_SIZE = 1;
+        // 地面范围半径（以原点为中心的方块数量），为了性能设为12x12，即从 -6 到 6
+        const GROUND_RADIUS = 7;
+        
+        // 创建地面（草地）
+        const grassColor = 0x7CFC00; // 草绿色
+        const dirtColor = 0x8B4513;  // 泥土色
+        
+        // 用于地面方块，我们使用简单的立方体材质，六个面颜色稍有不同？为了更像Minecraft，顶面草绿，侧面泥土带点绿。
+        // 简化：直接使用颜色材质，顶面和底面不同颜色。
+        // 更好的方式：创建一个函数根据位置生成方块，并添加到场景和blocks数组。
+        function createBlock(x, y, z, colorTop, colorSide, colorBottom, type = 'grass') {
+            // 为了简单，我们使用标准材质，但顶面和侧面不同颜色需要多个材质。这里简化为一个颜色，但草地我们用顶面绿色，侧面棕色。
+            // 实现：使用一个立方体，但为顶面和底面设置不同的材质？这样做比较复杂，因为标准BoxGeometry可以使用6个材质。
+            // 为了美观且简单，我们使用一个简单的材质，但草地和泥土的颜色不同。
+            // 这里直接使用单一颜色，但草地块顶面绿色，侧面和底面棕色。
+            // 为了视觉上更像，我们可以给顶面一个亮绿色，侧面暗绿色+棕色混合？直接使用一个绿色材质，但稍暗。
+            // 或者为了简单，草地全部使用绿色，泥土使用棕色。
+            // 这里为了省事，地面全部使用草地（绿色），但下面放置一些泥土？但地面已经够用了。
+            // 决定：地面第一层（y=0）使用草绿色，下面（y=-1）使用泥土棕色？但为了简单，只显示一层草方块。
+            // 使用MeshStandardMaterial并接收光照。
+            
+            // 但为了更像MC，我们使用带一点纹理的材质？无法使用外部图片，所以用纯色加边框？算了，纯色就好。
+            
+            // 为了让方块看起来有立体感，使用标准材质并添加轻微边缘光？标准材质加环境光和方向光就OK。
+            
+            // 根据类型选择材质
+            let material;
+            if (type === 'grass') {
+                // 使用一种草绿色，带一点黄
+                material = new THREE.MeshStandardMaterial({ color: 0x5cb85c, roughness: 0.7, emissive: new THREE.Color(0x223300) });
+            } else if (type === 'dirt') {
+                material = new THREE.MeshStandardMaterial({ color: 0x8B5A2B, roughness: 0.9 });
+            } else if (type === 'stone') {
+                material = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.6 });
+            } else if (type === 'wood') {
+                material = new THREE.MeshStandardMaterial({ color: 0x8B4513, roughness: 0.8 });
+            } else {
+                // 默认草绿
+                material = new THREE.MeshStandardMaterial({ color: 0x5cb85c, roughness: 0.7 });
+            }
+            
+            const geometry = new THREE.BoxGeometry(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+            const cube = new THREE.Mesh(geometry, material);
+            cube.position.set(x, y, z);
+            cube.castShadow = true;
+            cube.receiveShadow = true;
+            
+            // 存储类型信息到userData
+            cube.userData = { type: type, isBlock: true };
+            
+            scene.add(cube);
+            blocks.push(cube);
+            return cube;
+        }
+
+        // 初始化地面（草地块）
+        // 为了性能，我们只生成一层地面，y=0 平面。范围从 -GROUND_RADIUS 到 GROUND_RADIUS
+        // 为了让世界看起来更大，再在下面加一层泥土？但地面层已经足够，下面不需要，因为看不到。
+        // 但玩家可能会破坏地面，所以下面暂时不生成其他方块，等被破坏后再放置新的。
+        // 生成一个 15x15 的地面
+        const halfRange = Math.floor(GROUND_RADIUS);
+        for (let i = -halfRange; i <= halfRange; i++) {
+            for (let j = -halfRange; j <= halfRange; j++) {
+                // 随机一些位置为泥土？不，全部草地
+                createBlock(i, 0, j, null, null, null, 'grass');
+            }
+        }
+        
+        // 添加一些随机的小山包或者树？为了不使场景太单调，加几块石头或者木头？
+        // 在几个位置放置一些石块或木头方块作为点缀，但不要太多。
+        // 在 (2,1,2) 处放置一个石头方块
+        // 但不能覆盖地面生成逻辑。手动添加几个
+        const decorations = [
+            { x: 2, y: 1, z: 2, type: 'stone' },
+            { x: -3, y: 1, z: -2, type: 'wood' },
+            { x: 4, y: 1, z: -3, type: 'stone' },
+            { x: -4, y: 1, z: 4, type: 'wood' },
+            { x: 1, y: 1, z: -4, type: 'grass' },
+            { x: -2, y: 1, z: 3, type: 'grass' },
+        ];
+        decorations.forEach(d => {
+            createBlock(d.x, d.y, d.z, null, null, null, d.type);
+        });
+
+        // 在玩家周围添加一些云？不必要。
+
+        // 现在，为了使得玩家能站在方块上，我们需要碰撞检测和重力。实现简单的第一人称控制。
+        
+        // --- 控制器 (PointerLockControls) ---
+        const controls = new PointerLockControls(camera, renderer.domElement);
+        
+        // 添加一个点击开始提示
+        const startPrompt = document.createElement('div');
+        startPrompt.style.position = 'absolute';
+        startPrompt.style.top = '50%';
+        startPrompt.style.left = '50%';
+        startPrompt.style.transform = 'translate(-50%, -50%)';
+        startPrompt.style.background = 'rgba(0,0,0,0.8)';
+        startPrompt.style.color = 'white';
+        startPrompt.style.padding = '20px 40px';
+        startPrompt.style.borderRadius = '12px';
+        startPrompt.style.fontSize = '24px';
+        startPrompt.style.cursor = 'pointer';
+        startPrompt.style.zIndex = '200';
+        startPrompt.textContent = '点击开始游戏';
+        startPrompt.style.pointerEvents = 'auto';
+        document.body.appendChild(startPrompt);
+
+        startPrompt.addEventListener('click', () => {
+            controls.lock();
+        });
+
+        controls.addEventListener('lock', () => {
+            startPrompt.style.display = 'none';
+        });
+
+        controls.addEventListener('unlock', () => {
+            startPrompt.style.display = 'block';
+        });
+
+        scene.add(controls.getObject()); // 将控制器的对象（相机）添加到场景？实际上PointerLockControls直接操作camera，但camera已经默认在场景中？我们需要将camera加入场景吗？不需要，camera不需要作为场景子级，但为了位置更新，我们直接设置camera.position。PointerLockControls会修改camera的位置和旋转吗？不会，它只负责旋转（鼠标），移动需要我们自己控制。
+        // 标准用法：PointerLockControls 只处理鼠标旋转，移动需要自己实现。我们将camera的位置更新逻辑放在动画循环中。
+        
+        // 但PointerLockControls 会使用 camera 作为观察者，我们需要自己处理移动和碰撞。
+        
+        // 设置相机初始位置
+        camera.position.set(0, 3, 5); // 稍微抬高一点
+        
+        // --- 玩家状态 ---
+        const player = {
+            height: 1.8,      // 玩家身高（眼睛高度约1.6，但为了碰撞，我们使用一个圆柱体高度）
+            radius: 0.4,      // 玩家半径
+            velocity: new THREE.Vector3(0, 0, 0),
+            onGround: false,
+            speed: 5.0,       // 移动速度
+            jumpSpeed: 8.0,   // 跳跃速度
+            gravity: 20.0     // 重力加速度
+        };
+        
+        // 为了碰撞检测，我们需要存储所有方块的位置和大小。
+        // 由于方块都是1x1x1的立方体，中心在(x, y, z)，范围是[x-0.5, x+0.5]等。
+        // 我们可以遍历blocks数组进行碰撞检测，但为了性能，可以只检测附近的方块。这里方块数量不多（约200个），直接遍历也可以。
+        
+        // 玩家碰撞检测函数：检测玩家是否与任何方块相交
+        // 玩家可以看作是一个圆柱体，但简化起见，我们使用一个AABB（轴对齐包围盒）或者直接用多个点检测。
+        // 更简单的做法：使用一个半径为player.radius的球体？但站在方块上需要检测底部。
+        // 这里我们采用常见做法：分别检测X, Y, Z轴的移动，每次移动后检查与所有方块的碰撞，然后修正位置。
+        // 由于方块都是单位立方体，我们可以将玩家的包围盒视为宽高深为 2*radius, height, 2*radius。
+        // 但更好的做法：使用点与方块的距离判断，但为了简单，我们用AABB。
+        // 定义玩家的AABB：minX = x - radius, maxX = x + radius, minY = y - height/2, maxY = y + height/2, minZ = z - radius, maxZ = z + radius。
+        // 但通常玩家眼睛高度为 height/2 + 0.2? 我们让camera位于玩家顶部略下？简化：相机位置就是玩家位置，玩家高度设为一个值，碰撞时使用包围盒。
+        // 为了更方便，我们将相机放在玩家眼睛高度，玩家底部到眼睛的高度约为1.6，那么玩家总高度1.8，底部低于眼睛0.2？直接让眼睛位置代表玩家位置，包围盒以该位置为中心，高度为1.8，即从 y-0.9 到 y+0.9。
+        // 但这样玩家可能会卡到方块。我们调整：眼睛高度为1.6，底部在 y - 1.6，顶部在 y + 0.2? 算了，简单起见，我们用以下方式：
+        // 玩家位置代表脚底位置？不，相机需要看到周围。更常见：相机位置是眼睛位置，玩家碰撞盒从相机位置往下高度1.6，往上0.2（总高度1.8）。但简单起见，我们直接使用一个点作为玩家位置，并以该点为中心的球体碰撞？但站立需要底面。
+        // 我决定：玩家碰撞盒为 AABB，中心在 (x, y, z)，半高为 0.9 (总高1.8)，半宽为 0.4。相机位于 (x, y+0.6, z) 左右？为了视角，让相机在玩家中心上方0.6，即眼睛高度在y+0.6。
+        // 修改：设置相机位置为 (x, y+0.6, z)，玩家逻辑位置为 (x, y, z) 代表脚底？那样相机就在脚底上方0.6，太低了。
+        // 为了视觉正常且代码简单，我放弃复杂碰撞，采用简单方法：玩家位置即相机位置，并给一个半径0.4，高度1.8的包围盒，中心在相机位置。这样相机在盒子中间，看起来还可以。
+        // 那么站在方块上时，相机位置 = 方块顶部 + 0.9？这样眼睛距离地面1.8，有点高，但可以接受。
+        // 就这样吧，简单为主。
+        
+        // 我们重新定义：玩家位置就是相机位置。碰撞盒中心即相机位置，宽高深为 (0.8, 1.8, 0.8) 即半宽0.4，半高0.9。
+        // 这样玩家脚底在 y - 0.9，头顶在 y + 0.9。
+        
+        // 因为初始相机在 (0,3,5)，我们确保下方有方块。
+        
+        // 碰撞检测函数
+        function checkCollision(position) {
+            // 玩家包围盒半宽/半高/半深
+            const halfWidth = 0.4;
+            const halfHeight = 0.9;
+            const halfDepth = 0.4;
+            
+            // 计算玩家包围盒的最小最大值
+            const minX = position.x - halfWidth;
+            const maxX = position.x + halfWidth;
+            const minY = position.y - halfHeight;
+            const maxY = position.y + halfHeight;
+            const minZ = position.z - halfDepth;
+            const maxZ = position.z + halfDepth;
+            
+            // 遍历所有方块
+            for (let block of blocks) {
+                // 方块中心
+                const bx = block.position.x;
+                const by = block.position.y;
+                const bz = block.position.z;
+                
+                // 方块半宽 (0.5)
+                const bHalf = 0.5;
+                
+                // 检测AABB相交
+                if (maxX > bx - bHalf && minX < bx + bHalf &&
+                    maxY > by - bHalf && minY < by + bHalf &&
+                    maxZ > bz - bHalf && minZ < bz + bHalf) {
+                    return block; // 发生碰撞，返回碰撞的方块
+                }
+            }
+            return null; // 无碰撞
+        }
+        
+        // 为了更流畅的移动，我们使用分轴移动方法。
+        
+        // --- 键盘输入 ---
+        const keyState = {
+            w: false,
+            a: false,
+            s: false,
+            d: false,
+            space: false
+        };
+        
+        window.addEventListener('keydown', (event) => {
+            switch (event.code) {
+                case 'KeyW': keyState.w = true; break;
+                case 'KeyA': keyState.a = true; break;
+                case 'KeyS': keyState.s = true; break;
+                case 'KeyD': keyState.d = true; break;
+                case 'Space': 
+                    keyState.space = true; 
+                    event.preventDefault(); // 防止页面滚动
+                    break;
+            }
+        });
+        
+        window.addEventListener('keyup', (event) => {
+            switch (event.code) {
+                case 'KeyW': keyState.w = false; break;
+                case 'KeyA': keyState.a = false; break;
+                case 'KeyS': keyState.s = false; break;
+                case 'KeyD': keyState.d = false; break;
+                case 'Space': keyState.space = false; event.preventDefault(); break;
+            }
+        });
+        
+        // --- 鼠标点击：破坏和放置方块 ---
+        // 左键破坏，右键放置
+        window.addEventListener('mousedown', (event) => {
+            if (!controls.isLocked) return; // 只有锁定时才操作
+            
+            // 左键 (0) 破坏
+            if (event.button === 0) {
+                // 使用射线检测获取鼠标指向的方块
+                const raycaster = new THREE.Raycaster();
+                const mouse = new THREE.Vector2(0, 0); // 屏幕中心
+                raycaster.setFromCamera(mouse, camera);
+                
+                // 检测所有方块
+                const intersects = raycaster.intersectObjects(blocks);
+                
+                if (intersects.length > 0) {
+                    // 取第一个相交的方块
+                    const hit = intersects[0];
+                    const block = hit.object;
+                    
+                    // 从场景中移除
+                    scene.remove(block);
+                    // 从blocks数组中移除
+                    const index = blocks.indexOf(block);
+                    if (index !== -1) blocks.splice(index, 1);
+                    
+                    // 清理几何体和材质以释放内存 (可选)
+                    // block.geometry.dispose();
+                    // if (Array.isArray(block.material)) block.material.forEach(m => m.dispose());
+                    // else block.material.dispose();
+                }
+            }
+            
+            // 右键 (2) 放置
+            if (event.button === 2) {
+                // 阻止默认右键菜单
+                event.preventDefault();
+                
+                const raycaster = new THREE.Raycaster();
+                const mouse = new THREE.Vector2(0, 0);
+                raycaster.setFromCamera(mouse, camera);
+                
+                const intersects = raycaster.intersectObjects(blocks);
+                
+                if (intersects.length > 0) {
+                    const hit = intersects[0];
+                    const block = hit.object;
+                    
+                    // 计算放置位置：在相交面的法线方向偏移
+                    const normal = hit.face.normal.clone();
+                    // 变换法线到世界空间（因为方块可能被旋转？没有旋转，所以可以直接用）
+                    // 但我们没有旋转，所以直接使用
+                    const placePos = block.position.clone().add(normal);
+                    
+                    // 检查该位置是否已经存在方块（避免重叠）
+                    let occupied = false;
+                    for (let b of blocks) {
+                        if (b.position.distanceTo(placePos) < 0.1) {
+                            occupied = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!occupied) {
+                        // 放置新方块，使用与点击方块相同的类型？或者使用固定的石头类型？
+                        // 为了多样性，使用点击方块的类型，但如果是草地，则放置草地，否则放置石头？
+                        // 简单起见：放置石头方块？或者放置草地？这里放置与点击方块相同类型的方块。
+                        const type = block.userData.type || 'grass';
+                        // 在placePos位置创建新方块
+                        createBlock(placePos.x, placePos.y, placePos.z, null, null, null, type);
+                    }
+                }
+            }
+        });
+        
+        // 禁用右键菜单
+        window.addEventListener('contextmenu', (e) => e.preventDefault());
+        
+        // --- 动画循环与移动逻辑 ---
+        let prevTime = performance.now();
+        
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const time = performance.now();
+            const delta = Math.min(0.1, (time - prevTime) / 1000); // 限制最大步长
+            prevTime = time;
+            
+            // 只有锁定时才处理移动
+            if (controls.isLocked) {
+                // 获取移动方向
+                const direction = new THREE.Vector3();
+                const speed = player.speed;
+                
+                // 根据按键计算移动向量（相对于相机朝向的水平分量）
+                const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+                forward.y = 0;
+                forward.normalize();
+                
+                const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+                right.y = 0;
+                right.normalize();
+                
+                // 移动向量
+                const moveVec = new THREE.Vector3(0, 0, 0);
+                if (keyState.w) moveVec.add(forward);
+                if (keyState.s) moveVec.sub(forward);
+                if (keyState.d) moveVec.add(right);
+                if (keyState.a) moveVec.sub(right);
+                
+                if (moveVec.length() > 0) {
+                    moveVec.normalize();
+                }
+                
+                // 水平移动速度
+                const horizontalSpeed = speed * delta;
+                
+                // 尝试移动X轴
+                const newPosX = camera.position.clone();
+                newPosX.x += moveVec.x * horizontalSpeed;
+                // 检查碰撞
+                if (!checkCollision(newPosX)) {
+                    camera.position.x = newPosX.x;
+                } else {
+                    // 如果发生碰撞，尝试减小移动量？为了平滑，就不移动了
+                }
+                
+                // 尝试移动Z轴
+                const newPosZ = camera.position.clone();
+                newPosZ.z += moveVec.z * horizontalSpeed;
+                if (!checkCollision(newPosZ)) {
+                    camera.position.z = newPosZ.z;
+                }
+                
+                // 垂直移动（跳跃和重力）
+                // 应用重力
+                player.velocity.y -= player.gravity * delta;
+                
+                // 跳跃
+                if (keyState.space && player.onGround) {
+                    player.velocity.y = player.jumpSpeed;
+                    player.onGround = false;
+                    keyState.space = false; // 防止按住连续跳跃，但可以再次按下？每次跳跃后需要重新按？但为了简单，置false
+                }
+                
+                // 计算垂直移动
+                const newPosY = camera.position.clone();
+                newPosY.y += player.velocity.y * delta;
+                
+                // 检查垂直碰撞
+                const collisionY = checkCollision(newPosY);
+                if (collisionY) {
+                    // 发生碰撞，可能是落到地面或者顶到方块
+                    if (player.velocity.y < 0) {
+                        // 下落碰撞，说明踩到方块了
+                        player.onGround = true;
+                        // 调整位置到方块顶部
+                        // 由于我们使用AABB，碰撞意味着玩家脚底低于方块顶部，需要将玩家往上推
+                        // 找到玩家脚底与方块顶部的差值
+                        // 但简单处理：停止垂直移动，将玩家位置稍微提高直到不碰撞？这可能会卡住。
+                        // 更好的方式：计算应该站在什么高度。
+                        // 由于是简易实现，我们只处理站在地面上的情况，将Y速度置0，并且通过循环上抬位置直到不碰撞。
+                        // 但为了简单，我们可以直接将玩家位置设为碰撞方块的上方。
+                        // 由于我们可能同时碰撞多个方块，这里简单处理：将玩家位置往上移动一点点直到不碰撞。
+                        let testPos = camera.position.clone();
+                        let attempts = 0;
+                        while (checkCollision(testPos) && attempts < 10) {
+                            testPos.y += 0.1;
+                            attempts++;
+                        }
+                        if (attempts < 10) {
+                            camera.position.y = testPos.y;
+                        }
+                        player.velocity.y = 0;
+                    } else if (player.velocity.y > 0) {
+                        // 头部撞到方块
+                        player.velocity.y = 0;
+                        // 稍微下移一点
+                        camera.position.y -= 0.1;
+                    }
+                } else {
+                    // 没有碰撞，正常移动
+                    camera.position.y = newPosY.y;
+                    // 如果正在下落且没有碰撞，说明在空中
+                    if (player.velocity.y < 0) {
+                        player.onGround = false;
+                    }
+                }
+                
+                // 边界限制（可选，防止掉出世界太远）
+                if (camera.position.y < -10) {
+                    // 掉出世界，重置位置
+                    camera.position.set(0, 5, 5);
+                    player.velocity.set(0, 0, 0);
+                }
+                
+                // 简单的地面检测：如果下方有方块但未检测到碰撞（因为速度可能不够），补充检测
+                // 这可能会有点冗余，但能防止掉下去
+                const belowPos = camera.position.clone();
+                belowPos.y -= 0.9 + 0.1; // 脚底以下一点
+                const belowCollision = checkCollision(belowPos);
+                if (belowCollision && player.velocity.y <= 0) {
+                    player.onGround = true;
+                } else if (!belowCollision) {
+                    // 如果脚底没有方块，且垂直速度很小，可能是站在边缘，但为了安全，可以设onGround为false
+                    // 但为了让玩家能站在方块边缘，需要更精细的检测，这里忽略。
+                }
+                
+                // 限制玩家在水平方向不超出太远（可选）
+                if (Math.abs(camera.position.x) > 20) camera.position.x = Math.sign(camera.position.x) * 20;
+                if (Math.abs(camera.position.z) > 20) camera.position.z = Math.sign(camera.position.z) * 20;
+            }
+            
+            renderer.render(scene, camera);
+        }
+        
+        animate();
+        
+        // --- 窗口大小自适应 ---
+        window.addEventListener('resize', onWindowResize, false);
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+        
+        // 初始化一些额外的方块在玩家附近以便测试放置和破坏
+        // 已经在前面添加过了
+        
+        // 由于我们使用了PointerLockControls，需要将camera作为其对象？不，它直接使用camera。
+        // 但为了确保相机位置更新，我们不需要将相机添加到场景，因为渲染器会自动使用camera。
+        
+        // 注意：PointerLockControls的getObject()返回的是camera，但不需要add到scene，如果添加了可能会导致双重变换。
+        // 但为了统一，我们不添加。
+        
+        // 小修复：初始相机位置稍微抬高确保不卡在地面里
+        camera.position.set(0, 2, 5);
+        
+        // 开始时让玩家站在地面上：因为地面在y=0，玩家相机高度为2，脚底在1.1（因为半高0.9），所以会掉落到地面。由于有重力，会自动下落。
+        // 我们初始化玩家垂直速度为0，重力会将其拉到地面。
+        player.velocity.set(0, 0, 0);
+        player.onGround = false;
+        
+        // 补充一些远处的方块来丰富场景
+        // 在远处随机添加一些方块？也可以不加。
+        
+        // 但为了防止玩家跑出地面范围，地面范围是[-7,7]所以足够。
+        
+        // 添加一点环境装饰：在四周放置一些柱子？
+        for (let i = -6; i <= 6; i+=3) {
+            for (let j = -6; j <= 6; j+=3) {
+                if (i === 0 && j === 0) continue;
+                // 随机高度
+                const h = Math.floor(Math.random() * 3) + 1;
+                for (let k = 1; k <= h; k++) {
+                    if (Math.random() > 0.5) continue; // 随机跳过一些，使稀疏
+                    createBlock(i, k, j, null, null, null, 'stone');
+                }
+            }
+        }
+        
+        // 重新计算blocks数组？已经包含了所有新创建的方块。
+        
+        // 注意：由于我们在添加blocks时使用了push，所以blocks数组包含所有方块。
+        
+        console.log('游戏已启动！');
+        
+    </script>
+</body>
+</html>
